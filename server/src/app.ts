@@ -5,11 +5,12 @@ import { z, ZodError } from 'zod';
 import { API_ROUTES } from '@zhidedeng/shared';
 import type { ApiContracts, ApiRouteName, ChangePasswordRequest, LoginRequest, RegisterRequest } from '@zhidedeng/shared';
 import { AttemptLimiter, burnPasswordCheck, clearedSessionCookie, createSession, deleteOtherSessions, deleteSession, hashPassword, INITIAL_TOKENS, isWeakPassword, sessionCookie, sessionHandle, USERNAME, verifyPassword } from './auth.ts';
-import { authorizeAdmin, importResponse } from './catalog.ts';
+import { authorizeAdmin, adminSlug, createModel, createVendor, deleteModel, importResponse } from './catalog.ts';
 import type { Store } from './database.ts';
 import { Service } from './service.ts';
 import { ApiError } from './errors.ts';
 import { listPosts, reviewPost, setAccountDisabled, setCommentHidden } from './moderation.ts';
+import { enqueueSubmission, listSubmissions, reviewSubmission, submissionQuerySchema, submissionReviewSchema } from './submissions.ts';
 
 const pagination = {
   page: z.coerce.number().int().min(1).max(1_000_000).optional(),
@@ -80,7 +81,7 @@ export function buildApp(store: Store, now: () => Date, options: AppOptions = {}
   const app = new Hono<{ Bindings: Bindings }>();
   app.notFound(c => c.json({ error: { code: 'NOT_FOUND', message: '资源不存在' } }, 404));
   app.onError((error, c) => {
-    if (error instanceof ApiError) return c.json({ error: { code: error.code, message: error.message } }, error.status);
+    if (error instanceof ApiError) return c.json({ error: { code: error.code, message: error.message, ...error.details } }, error.status);
     if (error instanceof ZodError || error instanceof SyntaxError) return c.json({ error: { code: 'INVALID_INPUT', message: '请求参数或 JSON 正文无效' } }, 400);
     console.error(error);
     return c.json({ error: { code: 'INTERNAL_ERROR', message: '服务暂时不可用' } }, 500);
@@ -111,6 +112,62 @@ export function buildApp(store: Store, now: () => Date, options: AppOptions = {}
     await next();
   });
   app.post(IMPORT_PATH, async c => importResponse(store, await c.req.text()));
+  app.post('/api/admin/models', async c => {
+    const input = z.strictObject({
+      slug: adminSlug,
+      vendor: z.string().trim().min(1).max(64),
+      name: z.string().trim().min(1).max(60),
+      description: z.string().trim().min(1).max(200),
+    }).parse(await c.req.json());
+    return c.json(createModel(store, input));
+  });
+  app.delete('/api/admin/models/:slug', async c => {
+    z.strictObject({ confirm: z.literal(true) }).parse(await c.req.json());
+    return c.json(deleteModel(store, c.req.param('slug')));
+  });
+  app.post('/api/admin/vendors', async c => {
+    const input = z.strictObject({
+      slug: adminSlug,
+      name: z.string().trim().min(1).max(60),
+      iconKey: adminSlug.optional(),
+    }).parse(await c.req.json());
+    return c.json(createVendor(store, input));
+  });
+  app.post('/api/admin/submissions', async c => {
+    // 运维和同步脚本的入队入口。各渠道自己的接口（飞书同步、Agent 提交）后续接在这个函数上。
+    const input = z.object({
+      kind: z.enum(['station', 'model', 'post']),
+      channel: z.enum(['feishu', 'agent', 'web']),
+      originKey: z.string().trim().min(1).max(253),
+      payload: z.unknown(),
+      actorHandle: z.string().trim().max(200).nullish(),
+    }).parse(await c.req.json());
+    return c.json(enqueueSubmission(store, {
+      ...input, ip: c.req.header('x-forwarded-for')?.split(',')[0].trim() || 'admin', now: now(),
+    }));
+  });
+  app.get('/api/admin/submissions', c => {
+    const query = submissionQuerySchema.parse({ ...c.req.query(), status: c.req.query('status') ?? 'pending' });
+    return c.json(listSubmissions(store, query));
+  });
+  app.post('/api/admin/submissions/:id/review', async c => {
+    const decision = submissionReviewSchema.parse(await c.req.json());
+    return c.json(reviewSubmission(store, now(), c.req.param('id'), decision));
+  });
+  app.post('/api/admin/submissions/batch-review', async c => {
+    // 每条审核都是一个独立事务，限制批量规模避免一次请求长时间占用连接。
+    const { ids, ...decision } = submissionReviewSchema.extend({ ids: z.array(identifier).min(1).max(100) }).parse(await c.req.json());
+    const results = ids.map(id => {
+      try {
+        return { id, submission: reviewSubmission(store, now(), id, decision) };
+      } catch (error) {
+        if (error instanceof ApiError) return { id, error: { status: error.status, code: error.code, message: error.message, ...error.details } };
+        console.error(error);
+        return { id, error: { status: 500, code: 'INTERNAL_ERROR', message: '服务暂时不可用' } };
+      }
+    });
+    return c.json({ results });
+  });
   app.get('/api/admin/posts', c => c.json(listPosts(store, postStatus.parse(c.req.query('status')))));
   app.post('/api/admin/posts/:id/review', async c => {
     const { status } = z.strictObject({ status: postStatus }).parse(await c.req.json());

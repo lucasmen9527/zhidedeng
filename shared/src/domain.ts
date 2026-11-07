@@ -2,12 +2,14 @@ export type Id = string;
 export type ISODateTime = string;
 export type ISODate = string;
 export type VendorSlug = string;
+export const MIN_RATE = 0.05;
+export const MAX_RATE = 20;
 export type PostKind = 'deal' | 'review' | 'community' | 'guide';
 export type StationStatus = 'running' | 'unstable';
 export type TargetType = 'post' | 'station';
 export type VoteValue = 'up' | 'down' | null;
-// demo：虚构演示数据；submission：群友经飞书表单提交，未经平台核实。
-export type ContentSource = 'demo' | 'submission';
+// demo：虚构演示数据；submission：群友提交；agent：AI 采集。后两者未经平台核实。
+export type ContentSource = 'demo' | 'submission' | 'agent';
 export type PostStatus = 'pending' | 'approved' | 'rejected';
 
 export interface Vendor {
@@ -88,7 +90,7 @@ export interface Station extends InteractionState {
   score: number | null;
   // 只含协议、主机和路径，不带 query 与 fragment。
   url: string | null;
-  source: ContentSource;
+  source: ContentSource | 'user';
 }
 
 export interface StationOffer {

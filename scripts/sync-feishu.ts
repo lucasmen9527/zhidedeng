@@ -14,6 +14,7 @@ import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MAX_RATE, MIN_RATE } from '@zhidedeng/shared';
 import type { CatalogImportPost, CatalogImportRequest, CatalogImportResponse, CatalogImportStation } from '@zhidedeng/shared';
 
 export interface RawRecord {
@@ -151,8 +152,12 @@ function parseOffers(raw: unknown, models: Map<string, string>, report: (message
       continue;
     }
     const rate = /^\d+(\.\d+)?\s*[xX倍]?$/.test(parts[2]) ? Number.parseFloat(parts[2]) : Number.NaN;
-    if (!Number.isFinite(rate) || rate <= 0) {
+    if (!Number.isFinite(rate)) {
       report(`倍率必须是大于 0 的数字，已跳过：${line}`);
+      continue;
+    }
+    if (rate < MIN_RATE || rate > MAX_RATE) {
+      report(`倍率超出 ${MIN_RATE}~${MAX_RATE} 范围，已跳过`);
       continue;
     }
     offers.set(modelSlug, rate);
@@ -350,6 +355,8 @@ async function main(dryRun: boolean, config: Config) {
   if (!response.ok) throw new Error(`导入失败：HTTP ${response.status} ${await response.text()}`);
   const result = await response.json() as CatalogImportResponse;
   console.log(`导入完成：${result.changed ? '内容有变化' : '内容无变化'}，站点 ${result.stations}，报价 ${result.offers}，文章 ${result.posts}`);
+  // 旧版服务端的响应里没有 skipped，这里按可选处理，脚本可以先于服务端升级。
+  for (const line of result.skipped ?? []) console.log(`[跳过] ${line.slug}：${line.reason}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

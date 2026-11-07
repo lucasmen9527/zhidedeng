@@ -1,5 +1,9 @@
 import { z, ZodError } from 'zod';
-import type { CatalogImportRequest, CatalogImportResponse } from '@zhidedeng/shared';
+import { MAX_RATE, MIN_RATE } from '@zhidedeng/shared';
+import type {
+  AdminCreateModelRequest, AdminCreateVendorRequest, AdminDeleteModelResponse,
+  CatalogImportRequest, CatalogImportResponse, Model, Vendor,
+} from '@zhidedeng/shared';
 import type { Store } from './database.ts';
 import { ApiError } from './errors.ts';
 
@@ -9,7 +13,10 @@ const IS_SUBMISSION = "json_extract(data,'$.source') = 'submission'";
 const SUBMITTED_STATIONS = `(SELECT id FROM entities WHERE kind = 'station' AND ${IS_SUBMISSION})`;
 
 const singleLine = (max: number) => z.string().min(1).max(max);
-const httpUrl = z.string().max(300).refine(value => {
+export const offerRate = z.number().refine(rate => rate >= MIN_RATE && rate <= MAX_RATE, {
+  error: issue => ({ message: `倍率 ${String(issue.input)} 超出 ${MIN_RATE}~${MAX_RATE} 范围` }),
+});
+export const httpUrl = z.string().max(300).refine(value => {
   if (value.includes('?') || value.includes('#')) return false;
   try {
     const url = new URL(value);
@@ -19,6 +26,7 @@ const httpUrl = z.string().max(300).refine(value => {
   }
 });
 const importSchema: z.ZodType<CatalogImportRequest> = z.strictObject({
+  allowNewModels: z.boolean().optional(),
   stations: z.array(z.strictObject({
     slug: z.string().regex(/^sub-[a-z0-9-]{1,120}$/),
     name: singleLine(60),
@@ -26,7 +34,7 @@ const importSchema: z.ZodType<CatalogImportRequest> = z.strictObject({
     url: httpUrl,
     rechargeThreshold: z.number().min(0).nullable(),
     paymentMethods: z.array(singleLine(20)).max(10),
-    offers: z.array(z.strictObject({ modelSlug: singleLine(200), rate: z.number().positive() })).max(100),
+    offers: z.array(z.strictObject({ modelSlug: singleLine(200), rate: offerRate })).max(100),
   })),
   posts: z.array(z.strictObject({
     recordId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
@@ -57,23 +65,41 @@ function importCatalog(store: Store, input: CatalogImportRequest): CatalogImport
   return store.transaction(() => {
     const models = new Set(store.all('model').map(model => model.slug));
     const offers = input.stations.flatMap(({ slug, offers }) => offers.map(offer => ({ stationSlug: slug, ...offer })));
-    const unknown = offers.find(offer => !models.has(offer.modelSlug));
-    if (unknown) throw new ApiError(400, 'INVALID_INPUT', `未知模型：${unknown.modelSlug}`);
+    const unknown = [...new Set(offers.map(offer => offer.modelSlug).filter(slug => !models.has(slug)))];
+    if (unknown.length && !input.allowNewModels) throw new ApiError(400, 'INVALID_INPUT', `未知模型：${unknown[0]}`);
+
+    // 已经有其他通道（投稿队列）物化过的站点，本接口不再覆盖：它下次同步又会覆盖回来，
+    // 而且 DELETE 只清 source='submission'，会留下 agent 站点的残留报价撞上唯一约束。
+    // PR4 把飞书接入队列后，这条过渡保护就可以删掉。
+    const managed = new Set(store.all('station').filter(station => station.source !== 'submission' && station.source !== 'demo').map(station => station.slug));
+    const skipped = input.stations.filter(station => managed.has(station.slug)).map(station => ({ slug: station.slug, reason: '该站点已由其他通道接管' }));
+    const accepted = input.stations.filter(station => !managed.has(station.slug));
+    const acceptedOffers = offers.filter(offer => !managed.has(offer.stationSlug));
 
     const before = submissionFingerprint(store);
+    // 自动创建的占位模型统一挂在 unknown 厂商下，等管理员补全或改建正式厂商。
+    // slug 与直接新增用同一套规则校验，否则像 foo/bar 这种会成为 /models/:slug 无法路由的孤儿。
+    if (unknown.length) {
+      const invalid = unknown.find(slug => !adminSlug.safeParse(slug).success);
+      if (invalid) throw new ApiError(400, 'INVALID_INPUT', `未知模型 ${invalid} 不符合 slug 规则，无法自动收录，请先在模型管理接口补录`);
+      if (!store.get('vendor', 'unknown')) store.put('vendor', 'unknown', { slug: 'unknown', name: '未知厂商', iconKey: 'unknown' });
+      for (const slug of unknown) {
+        store.put('model', slug, { slug, vendor: 'unknown', name: slug, description: '群友/Agent 提交时自动创建，待补全', tags: [] });
+      }
+    }
     store.db.prepare(`DELETE FROM offers WHERE stationSlug IN ${SUBMITTED_STATIONS}`).run();
     store.db.prepare(`DELETE FROM entities WHERE ${IS_SUBMISSION}`).run();
-    for (const { offers: _offers, ...station } of input.stations) {
+    for (const { offers: _offers, ...station } of accepted) {
       store.put('station', station.slug, { ...station, uptime: null, firstTokenLatencyMs: null, foundedAt: null, status: null, source: 'submission' });
     }
-    for (const offer of offers) {
+    for (const offer of acceptedOffers) {
       store.db.prepare('INSERT INTO offers (stationSlug, modelSlug, rate) VALUES (?, ?, ?)').run(offer.stationSlug, offer.modelSlug, offer.rate);
     }
     for (const { recordId, authorName, ...post } of input.posts) {
       const id = `feishu-${recordId}`;
       store.put('post', id, { ...post, id, kind: 'review', authorHandle: 'feishu-submission', authorNickname: authorName, modelSlug: null, cover: null, source: 'submission', status: 'approved' });
     }
-    return { changed: submissionFingerprint(store) !== before, stations: input.stations.length, offers: offers.length, posts: input.posts.length };
+    return { changed: unknown.length > 0 || submissionFingerprint(store) !== before, stations: accepted.length, offers: acceptedOffers.length, posts: input.posts.length, createdModels: unknown.sort(), skipped };
   });
 }
 
@@ -84,7 +110,11 @@ export function importResponse(store: Store, rawBody: string) {
   try {
     return respond(importCatalog(store, importSchema.parse(JSON.parse(rawBody))), 200);
   } catch (error) {
-    if (error instanceof ZodError || error instanceof SyntaxError) return refuse(400, 'INVALID_INPUT', '导入内容无效');
+    if (error instanceof ZodError) {
+      const rateIssue = error.issues.find(issue => issue.code === 'custom' && issue.message.startsWith('倍率 '));
+      return refuse(400, 'INVALID_INPUT', rateIssue?.message ?? '导入内容无效');
+    }
+    if (error instanceof SyntaxError) return refuse(400, 'INVALID_INPUT', '导入内容无效');
     if (error instanceof ApiError) return refuse(error.status, error.code, error.message);
     throw error;
   }
@@ -92,6 +122,46 @@ export function importResponse(store: Store, rawBody: string) {
 
 /** 管理接口密钥的最短长度，短于它视为未配置。 */
 export const MIN_SYNC_TOKEN_LENGTH = 32;
+
+// 模型和厂商的 slug 共用同一套规则：小写字母、数字和连字符，最长 64。
+const slugPattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export const adminSlug = z.string().trim().regex(slugPattern);
+
+export function createVendor(store: Store, input: AdminCreateVendorRequest): Vendor {
+  return store.transaction(() => {
+    if (store.get('vendor', input.slug)) throw new ApiError(409, 'VENDOR_EXISTS', `厂商已存在：${input.slug}`);
+    const vendor: Vendor = { slug: input.slug, name: input.name, iconKey: input.iconKey ?? input.slug };
+    store.put('vendor', vendor.slug, vendor);
+    return vendor;
+  });
+}
+
+export function createModel(store: Store, input: AdminCreateModelRequest): Model {
+  return store.transaction(() => {
+    if (store.get('model', input.slug)) throw new ApiError(409, 'MODEL_EXISTS', `模型已存在：${input.slug}`);
+    if (!store.get('vendor', input.vendor)) throw new ApiError(400, 'INVALID_INPUT', `厂商不存在：${input.vendor}`);
+    const model: Model = { slug: input.slug, vendor: input.vendor, name: input.name, description: input.description, tags: [] };
+    store.put('model', model.slug, model);
+    return model;
+  });
+}
+
+export function deleteModel(store: Store, slug: string): AdminDeleteModelResponse {
+  return store.transaction(() => {
+    if (!store.get('model', slug)) throw new ApiError(404, 'NOT_FOUND', `模型不存在：${slug}`);
+    const offers = store.db.prepare('SELECT COUNT(DISTINCT stationSlug) AS count FROM offers WHERE modelSlug = ?').get(slug)!;
+    const stationCount = Number(offers.count);
+    // 文章也会关联模型，直接删会留下指向不存在模型的引用。
+    const posts = store.db.prepare("SELECT COUNT(*) AS count FROM entities WHERE kind = 'post' AND json_extract(data,'$.modelSlug') = ?").get(slug)!;
+    const postCount = Number(posts.count);
+    if (stationCount + postCount > 0) {
+      const used = [stationCount && `${stationCount} 个站点的报价`, postCount && `${postCount} 篇文章`].filter(Boolean).join('和');
+      throw new ApiError(409, 'MODEL_IN_USE', `模型仍被${used}引用`, { stationCount, postCount });
+    }
+    store.db.prepare('DELETE FROM entities WHERE kind = ? AND id = ?').run('model', slug);
+    return { slug, deleted: true };
+  });
+}
 
 /** 先取摘要再逐字节比较，耗时与 token 内容和长度都无关。 */
 async function constantTimeEqual(left: string, right: string) {
